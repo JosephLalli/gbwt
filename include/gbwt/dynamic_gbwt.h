@@ -26,6 +26,8 @@
 #ifndef GBWT_DYNAMIC_GBWT_H
 #define GBWT_DYNAMIC_GBWT_H
 
+#include <atomic>
+#include <exception>
 #include <thread>
 
 #include <gbwt/gbwt.h>
@@ -400,7 +402,8 @@ class GBWTBuilder
 public:
   GBWTBuilder(size_type node_width,
               size_type batch_size = DynamicGBWT::INSERT_BATCH_SIZE,
-              size_type sample_interval = DynamicGBWT::SAMPLE_INTERVAL);
+              size_type sample_interval = DynamicGBWT::SAMPLE_INTERVAL,
+              size_type insertion_threads = 1);
   ~GBWTBuilder();
 
   void swapIndex(DynamicGBWT& another_index);
@@ -420,6 +423,14 @@ public:
   GBWTBuilder& operator= (const GBWTBuilder&) = delete;
 
 private:
+  // Independent builders remain serial by default. Explicit workers are used
+  // within large insertion batches, without changing global OpenMP settings.
+  size_type insertion_threads;
+  std::exception_ptr builder_error;
+  std::atomic<bool> builder_failed;
+
+  // A failed batch may have partially changed records. Never reuse that index.
+  void rethrowIfFailed() const;
   void flush();
 }; // class GBWTBuilder
 
