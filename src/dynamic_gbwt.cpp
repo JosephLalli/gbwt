@@ -564,7 +564,73 @@ swapBody(DynamicRecord& record, RunMerger& merger)
   std::swap(merger.total_size, record.body_size);
 }
 
+namespace
+{
+
 constexpr size_type MIN_PARALLEL_INSERT_SEQUENCES = 8192;
+
+// All allocations made by a job are inside its try block. Each worker owns
+// its error slot; the implicit barrier precedes propagation to the caller.
+template<class Job>
+void insertionJobs(size_type count, size_type threads, const Job& job)
+{
+  threads = std::min(threads, count);
+  if(threads <= 1)
+  {
+    for(size_type i = 0; i < count; i++) { job(i); }
+    return;
+  }
+  std::vector<std::exception_ptr> errors(threads);
+  #pragma omp parallel for num_threads(threads) schedule(dynamic, 16)
+  for(size_type i = 0; i < count; i++)
+  {
+    std::exception_ptr& error = errors[omp_get_thread_num()];
+    if(error) { continue; }
+    try { job(i); }
+    catch(...) { error = std::current_exception(); }
+  }
+  for(const std::exception_ptr& error : errors)
+  {
+    if(error) { std::rethrow_exception(error); }
+  }
+}
+
+std::vector<size_type> insertionGroups(const std::vector<Sequence>& seqs, bool next)
+{
+  std::vector<size_type> groups;
+  for(size_type i = 0; i < seqs.size(); i++)
+  {
+    if(i == 0 || (next ? seqs[i].next != seqs[i - 1].next : seqs[i].curr != seqs[i - 1].curr))
+    {
+      groups.push_back(i);
+    }
+  }
+  groups.push_back(seqs.size());
+  return groups;
+}
+
+// After sorting, insertion events are grouped by (next, curr). Apply all
+// increments owned by one next-record without scattered concurrent writes.
+void addIncomingCounts(DynamicRecord& current, const std::vector<Sequence>& seqs,
+  size_type begin, size_type limit)
+{
+  size_type inrank = 0;
+  for(size_type i = begin; i < limit; )
+  {
+    node_type predecessor = seqs[i].curr;
+    size_type end = i + 1;
+    while(end < limit && seqs[end].curr == predecessor) { end++; }
+    while(inrank < current.indegree() && current.predecessor(inrank) < predecessor) { inrank++; }
+    if(inrank == current.indegree() || current.predecessor(inrank) != predecessor)
+    {
+      current.incoming.insert(current.incoming.begin() + inrank, edge_type(predecessor, 0));
+    }
+    current.count(inrank) += end - i;
+    inrank++; i = end;
+  }
+}
+
+} // anonymous namespace
 
 /*
   Process ranges of sequences sharing the same 'curr' node.
@@ -660,50 +726,18 @@ updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteratio
     return i;
   };
 
-  if(threads <= 1 || seqs.size() < MIN_PARALLEL_INSERT_SEQUENCES)
+  if(threads <= 1)
   {
     for(size_type i = 0; i < seqs.size(); ) { i = update(i, seqs.size(), true); }
   }
   else
   {
-    std::vector<size_type> groups;
-    for(size_type i = 0; i < seqs.size(); i++)
-    {
-      if(i == 0 || seqs[i].curr != seqs[i - 1].curr) { groups.push_back(i); }
-    }
-    groups.push_back(seqs.size());
-
-    size_type group_count = groups.size() - 1;
-    threads = std::min(threads, group_count);
-    if(threads <= 1)
-    {
-      if(group_count > 0) { update(groups.front(), groups.back(), true); }
-    }
-    else
-    {
-      std::vector<std::exception_ptr> errors(threads);
-      // Each job owns one record and a disjoint sequence range. Incoming-edge
-      // writes are deferred until all record updates have finished.
-      #pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
-      for(size_type group = 0; group < group_count; group++)
-      {
-        std::exception_ptr& error = errors[omp_get_thread_num()];
-        if(error) { continue; }
-        try { update(groups[group], groups[group + 1], false); }
-        catch(...) { error = std::current_exception(); }
-      }
-      for(const std::exception_ptr& error : errors)
-      {
-        if(error) { std::rethrow_exception(error); }
-      }
-
-      // update() does not read incoming edges. Replaying the original updates
-      // after the worker barrier avoids cross-record writes in the workers.
-      for(const Sequence& seq : seqs)
-      {
-        if(seq.next != ENDMARKER) { gbwt.record(seq.next).increment(seq.curr); }
-      }
-    }
+    auto groups = insertionGroups(seqs, false);
+    // Each job owns one record and a disjoint sequence range. Incoming-edge
+    // writes are deferred until offsets are rebuilt after the phase barrier.
+    insertionJobs(groups.size() - 1, threads, [&](size_type group) {
+      update(groups[group], groups[group + 1], false);
+    });
   }
   gbwt.header.size += seqs.size();
 }
@@ -714,19 +748,23 @@ updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteratio
 */
 
 void
-nextPosition(std::vector<Sequence>& seqs, const text_type&)
+nextPosition(std::vector<Sequence>& seqs, const text_type&, size_type threads)
 {
-  for(Sequence& seq : seqs) { seq.pos++; }
+  if(threads == 1) { for(Sequence& seq : seqs) { seq.pos++; } return; }
+  #pragma omp parallel for num_threads(threads) schedule(static)
+  for(size_type i = 0; i < seqs.size(); i++) { seqs[i].pos++; }
 }
 
 void
-nextPosition(std::vector<Sequence>& seqs, const vector_type&)
+nextPosition(std::vector<Sequence>& seqs, const vector_type&, size_type threads)
 {
-  for(Sequence& seq : seqs) { seq.pos++; }
+  if(threads == 1) { for(Sequence& seq : seqs) { seq.pos++; } return; }
+  #pragma omp parallel for num_threads(threads) schedule(static)
+  for(size_type i = 0; i < seqs.size(); i++) { seqs[i].pos++; }
 }
 
 void
-nextPosition(std::vector<Sequence>& seqs, const GBWT& source)
+nextPosition(std::vector<Sequence>& seqs, const GBWT& source, size_type)
 {
   for(size_type i = 0; i < seqs.size(); )
   {
@@ -742,7 +780,7 @@ nextPosition(std::vector<Sequence>& seqs, const GBWT& source)
 }
 
 void
-nextPosition(std::vector<Sequence>& seqs, const DynamicGBWT& source)
+nextPosition(std::vector<Sequence>& seqs, const DynamicGBWT& source, size_type)
 {
   for(size_type i = 0; i < seqs.size(); )
   {
@@ -773,7 +811,15 @@ nextPosition(std::vector<Sequence>& seqs, const DynamicGBWT& source)
 void
 sortSequences(std::vector<Sequence>& seqs)
 {
-  sequentialSort(seqs.begin(), seqs.end());
+  // updateRecords preserves array order and assigns increasing offsets to
+  // equal (curr, next) sequences. Stability therefore preserves the required
+  // (curr, offset) secondary order without comparing it again. Keep this sort
+  // on the builder thread so allocation failures propagate to its caller.
+  auto by_next = [](const Sequence& a, const Sequence& b) { return a.next < b.next; };
+  if(!std::is_sorted(seqs.begin(), seqs.end(), by_next))
+  {
+    std::stable_sort(seqs.begin(), seqs.end(), by_next);
+  }
   size_type head = 0;
   while(head < seqs.size() && seqs[head].next == ENDMARKER) { head++; }
   if(head > 0)
@@ -793,8 +839,38 @@ sortSequences(std::vector<Sequence>& seqs)
 
 void
 rebuildOffsets(DynamicGBWT& gbwt, std::vector<Sequence>& seqs,
-  std::unique_ptr<std::unordered_map<node_type, size_type>>& endmarker_edges)
+  std::unique_ptr<std::unordered_map<node_type, size_type>>& endmarker_edges, size_type threads)
 {
+  if(threads > 1)
+  {
+    const auto& endmarker_lookup = *endmarker_edges;
+    auto groups = insertionGroups(seqs, true);
+    insertionJobs(groups.size() - 1, threads, [&](size_type group) {
+      size_type begin = groups[group], limit = groups[group + 1];
+      node_type next = seqs[begin].next;
+      DynamicRecord& target = gbwt.record(next);
+      addIncomingCounts(target, seqs, begin, limit);
+      size_type offset = 0;
+      for(edge_type inedge : target.incoming)
+      {
+        DynamicRecord& predecessor = gbwt.record(inedge.first);
+        rank_type outrank = (inedge.first == ENDMARKER ? endmarker_lookup.at(next) : predecessor.edgeToLinear(next));
+        predecessor.offset(outrank) = offset;
+        offset += inedge.second;
+      }
+      // Other jobs write different outgoing[].second fields. No job resizes
+      // outgoing or changes its node keys; this group owns every offset read
+      // below, so adjustment needs no further cross-group barrier.
+      for(size_type i = begin; i < limit; i++)
+      {
+        Sequence& seq = seqs[i];
+        const DynamicRecord& current = gbwt.record(seq.curr);
+        rank_type outrank = (seq.curr == ENDMARKER ? endmarker_lookup.at(next) : current.edgeToLinear(next));
+        seq.offset += current.offset(outrank);
+      }
+    });
+    return;
+  }
   node_type next = gbwt.sigma();
   for(const Sequence& seq : seqs)
   {
@@ -825,19 +901,29 @@ rebuildOffsets(DynamicGBWT& gbwt, std::vector<Sequence>& seqs,
 */
 
 void
-advancePosition(std::vector<Sequence>& seqs, const text_type& text)
+advancePosition(std::vector<Sequence>& seqs, const text_type& text, size_type threads)
 {
-  for(Sequence& seq : seqs) { seq.curr = seq.next; seq.next = text[seq.pos]; }
+  if(threads == 1) { for(Sequence& seq : seqs) { seq.curr = seq.next; seq.next = text[seq.pos]; } return; }
+  #pragma omp parallel for num_threads(threads) schedule(static)
+  for(size_type i = 0; i < seqs.size(); i++)
+  {
+    seqs[i].curr = seqs[i].next; seqs[i].next = text[seqs[i].pos];
+  }
 }
 
 void
-advancePosition(std::vector<Sequence>& seqs, const vector_type& text)
+advancePosition(std::vector<Sequence>& seqs, const vector_type& text, size_type threads)
 {
-  for(Sequence& seq : seqs) { seq.curr = seq.next; seq.next = text[seq.pos]; }
+  if(threads == 1) { for(Sequence& seq : seqs) { seq.curr = seq.next; seq.next = text[seq.pos]; } return; }
+  #pragma omp parallel for num_threads(threads) schedule(static)
+  for(size_type i = 0; i < seqs.size(); i++)
+  {
+    seqs[i].curr = seqs[i].next; seqs[i].next = text[seqs[i].pos];
+  }
 }
 
 void
-advancePosition(std::vector<Sequence>& seqs, const GBWT& source)
+advancePosition(std::vector<Sequence>& seqs, const GBWT& source, size_type)
 {
   // FIXME We could optimize further by storing the next position.
   for(size_type i = 0; i < seqs.size(); )
@@ -856,7 +942,7 @@ advancePosition(std::vector<Sequence>& seqs, const GBWT& source)
 }
 
 void
-advancePosition(std::vector<Sequence>& seqs, const DynamicGBWT& source)
+advancePosition(std::vector<Sequence>& seqs, const DynamicGBWT& source, size_type)
 {
   // FIXME We could optimize further by storing the next position.
   for(size_type i = 0; i < seqs.size(); )
@@ -905,12 +991,15 @@ insert(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, const Source& source, siz
 
   for(size_type iterations = 1; ; iterations++)
   {
-    updateRecords(gbwt, seqs, iterations, sample_interval, endmarker_edges, insertion_threads); // Insert the next nodes into the GBWT.
-    nextPosition(seqs, source); // Determine the next position for each sequence.
+    // Keep the same mode through the entire iteration: sorting can shrink the
+    // batch below the threshold, but deferred incoming counts still need applying.
+    size_type threads = (seqs.size() >= MIN_PARALLEL_INSERT_SEQUENCES ? insertion_threads : 1);
+    updateRecords(gbwt, seqs, iterations, sample_interval, endmarker_edges, threads); // Insert the next nodes into the GBWT.
+    nextPosition(seqs, source, threads); // Determine the next position for each sequence.
     sortSequences(seqs); // Sort for the next iteration and remove the ones that have finished.
     if(seqs.empty()) { return iterations; }
-    rebuildOffsets(gbwt, seqs, endmarker_edges); // Rebuild offsets in outgoing edges and sequences.
-    advancePosition(seqs, source); // Move the sequences to the next position.
+    rebuildOffsets(gbwt, seqs, endmarker_edges, threads); // Rebuild offsets in outgoing edges and sequences.
+    advancePosition(seqs, source, threads); // Move the sequences to the next position.
   }
 }
 
