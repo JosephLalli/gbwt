@@ -1,6 +1,7 @@
 #ifndef GBWT_DYNAMIC_GBWT_H
 #define GBWT_DYNAMIC_GBWT_H
 
+#include <exception>
 #include <thread>
 
 #include <gbwt/gbwt.h>
@@ -378,9 +379,13 @@ std::string indexType(const DynamicGBWT&);
 class GBWTBuilder
 {
 public:
+  // Zero insertion threads is normalized to one; workers update independent records.
+  // Background construction errors are rethrown after the builder thread is joined.
+  // A reported construction error may leave the index partially updated and unusable.
   GBWTBuilder(size_type node_width,
               size_type batch_size = DynamicGBWT::INSERT_BATCH_SIZE,
-              size_type sample_interval = DynamicGBWT::SAMPLE_INTERVAL);
+              size_type sample_interval = DynamicGBWT::SAMPLE_INTERVAL,
+              size_type insertion_threads = 1);
   ~GBWTBuilder();
 
   void swapIndex(DynamicGBWT& another_index);
@@ -400,6 +405,12 @@ public:
   GBWTBuilder& operator= (const GBWTBuilder&) = delete;
 
 private:
+  size_type insertion_threads;
+
+  // Read only after the builder thread has been joined.
+  std::exception_ptr builder_error;
+
+  void rethrowIfFailed() const;
   void flush();
 }; // class GBWTBuilder
 

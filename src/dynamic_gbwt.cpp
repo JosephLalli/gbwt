@@ -564,6 +564,8 @@ swapBody(DynamicRecord& record, RunMerger& merger)
   std::swap(merger.total_size, record.body_size);
 }
 
+constexpr size_type MIN_PARALLEL_INSERT_SEQUENCES = 8192;
+
 /*
   Process ranges of sequences sharing the same 'curr' node.
   - Add the outgoing edge (curr, next) if necessary.
@@ -579,9 +581,9 @@ swapBody(DynamicRecord& record, RunMerger& merger)
 
 void
 updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteration, size_type sample_interval,
-  std::unique_ptr<std::unordered_map<node_type, size_type>>& endmarker_edges)
+  std::unique_ptr<std::unordered_map<node_type, size_type>>& endmarker_edges, size_type threads)
 {
-  for(size_type i = 0; i < seqs.size(); )
+  auto update = [&](size_type i, size_type limit, bool update_incoming) -> size_type
   {
     node_type curr = seqs[i].curr;
     DynamicRecord& current = gbwt.record(curr);
@@ -590,7 +592,7 @@ updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteratio
     std::vector<run_type>::iterator iter = current.body.begin();
     std::vector<sample_type>::iterator sample_iter = current.ids.begin();
     size_type insert_count = 0;
-    while(i < seqs.size() && seqs[i].curr == curr)
+    while(i < limit && seqs[i].curr == curr)
     {
       // Determine the edge to the next node or add it if it does not exist.
       rank_type outrank = 0;
@@ -638,7 +640,7 @@ updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteratio
       }
       seqs[i].offset = new_body.counts[outrank]; // rank(next) within the record.
       new_body.insert(outrank); insert_count++;
-      if(seqs[i].next != ENDMARKER)  // The endmarker does not have incoming edges.
+      if(update_incoming && seqs[i].next != ENDMARKER)  // The endmarker does not have incoming edges.
       {
         gbwt.record(seqs[i].next).increment(curr);
       }
@@ -655,6 +657,53 @@ updateRecords(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, size_type iteratio
     }
     swapBody(current, new_body);
     current.ids.swap(new_samples);
+    return i;
+  };
+
+  if(threads <= 1 || seqs.size() < MIN_PARALLEL_INSERT_SEQUENCES)
+  {
+    for(size_type i = 0; i < seqs.size(); ) { i = update(i, seqs.size(), true); }
+  }
+  else
+  {
+    std::vector<size_type> groups;
+    for(size_type i = 0; i < seqs.size(); i++)
+    {
+      if(i == 0 || seqs[i].curr != seqs[i - 1].curr) { groups.push_back(i); }
+    }
+    groups.push_back(seqs.size());
+
+    size_type group_count = groups.size() - 1;
+    threads = std::min(threads, group_count);
+    if(threads <= 1)
+    {
+      if(group_count > 0) { update(groups.front(), groups.back(), true); }
+    }
+    else
+    {
+      std::vector<std::exception_ptr> errors(threads);
+      // Each job owns one record and a disjoint sequence range. Incoming-edge
+      // writes are deferred until all record updates have finished.
+      #pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
+      for(size_type group = 0; group < group_count; group++)
+      {
+        std::exception_ptr& error = errors[omp_get_thread_num()];
+        if(error) { continue; }
+        try { update(groups[group], groups[group + 1], false); }
+        catch(...) { error = std::current_exception(); }
+      }
+      for(const std::exception_ptr& error : errors)
+      {
+        if(error) { std::rethrow_exception(error); }
+      }
+
+      // update() does not read incoming edges. Replaying the original updates
+      // after the worker barrier avoids cross-record writes in the workers.
+      for(const Sequence& seq : seqs)
+      {
+        if(seq.next != ENDMARKER) { gbwt.record(seq.next).increment(seq.curr); }
+      }
+    }
   }
   gbwt.header.size += seqs.size();
 }
@@ -835,7 +884,8 @@ advancePosition(std::vector<Sequence>& seqs, const DynamicGBWT& source)
 
 template<class Source>
 size_type
-insert(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, const Source& source, size_type sample_interval)
+insert(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, const Source& source, size_type sample_interval,
+  size_type insertion_threads = 1)
 {
   // Sanity check sample interval only here.
   if(sample_interval == 0) { sample_interval = std::numeric_limits<size_type>::max(); }
@@ -855,7 +905,7 @@ insert(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, const Source& source, siz
 
   for(size_type iterations = 1; ; iterations++)
   {
-    updateRecords(gbwt, seqs, iterations, sample_interval, endmarker_edges); // Insert the next nodes into the GBWT.
+    updateRecords(gbwt, seqs, iterations, sample_interval, endmarker_edges, insertion_threads); // Insert the next nodes into the GBWT.
     nextPosition(seqs, source); // Determine the next position for each sequence.
     sortSequences(seqs); // Sort for the next iteration and remove the ones that have finished.
     if(seqs.empty()) { return iterations; }
@@ -883,7 +933,8 @@ insert(DynamicGBWT& gbwt, std::vector<Sequence>& seqs, const Source& source, siz
 template<class IntegerVector>
 void
 insertBatch(DynamicGBWT& index, const IntegerVector& text, size_type text_length,
-            size_type start_id, bool has_both_orientations, size_type sample_interval)
+            size_type start_id, bool has_both_orientations, size_type sample_interval,
+            size_type insertion_threads = 1)
 {
   double start = readTimer();
 
@@ -922,7 +973,7 @@ insertBatch(DynamicGBWT& index, const IntegerVector& text, size_type text_length
   index.resize(min_node - 1, max_node + 1);
 
   // Insert the sequences.
-  size_type iterations = gbwt::insert(index, seqs, text, sample_interval);
+  size_type iterations = gbwt::insert(index, seqs, text, sample_interval, insertion_threads);
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     double seconds = readTimer() - start;
@@ -1645,12 +1696,14 @@ indexType(const DynamicGBWT&)
 
 //------------------------------------------------------------------------------
 
-GBWTBuilder::GBWTBuilder(size_type node_width, size_type buffer_size, size_type sample_interval) :
+GBWTBuilder::GBWTBuilder(size_type node_width, size_type buffer_size, size_type sample_interval,
+  size_type insertion_threads) :
   input_buffer(buffer_size, 0, node_width), construction_buffer(buffer_size, 0, node_width),
   id_sample_interval(sample_interval),
   input_tail(0), construction_tail(0),
   inserted_sequences(0), batch_sequences(0),
-  has_both_orientations(true)
+  has_both_orientations(true),
+  insertion_threads(std::max<size_type>(1, std::min<size_type>(insertion_threads, omp_get_thread_limit())))
 {
 }
 
@@ -1663,12 +1716,16 @@ GBWTBuilder::~GBWTBuilder()
 void
 GBWTBuilder::swapIndex(DynamicGBWT& another_index)
 {
+  if(this->builder.joinable()) { this->builder.join(); }
+  this->rethrowIfFailed();
   this->index.swap(another_index);
 }
 
 void
 GBWTBuilder::insert(const vector_type& sequence, bool both_orientations)
 {
+  // A join publishes any exception stored by the background builder.
+  if(!this->builder.joinable()) { this->rethrowIfFailed(); }
   size_type space_required = sequence.size() + 1;
   if(both_orientations) { space_required *= 2; }
   this->has_both_orientations &= both_orientations;
@@ -1707,9 +1764,16 @@ GBWTBuilder::finish()
 
   // Wait for the construction thread to finish.
   if(this->builder.joinable()) { this->builder.join(); }
+  this->rethrowIfFailed();
 
   // Finally recode the index to make it serializable.
   this->index.recode();
+}
+
+void
+GBWTBuilder::rethrowIfFailed() const
+{
+  if(this->builder_error) { std::rethrow_exception(this->builder_error); }
 }
 
 void
@@ -1717,6 +1781,7 @@ GBWTBuilder::flush()
 {
   // Wait for the construction thread to finish.
   if(this->builder.joinable()) { this->builder.join(); }
+  this->rethrowIfFailed();
 
   // Swap the input buffer and the construction buffer.
   this->input_buffer.swap(this->construction_buffer);
@@ -1726,9 +1791,23 @@ GBWTBuilder::flush()
   // Launch a new construction thread if necessary.
   if(this->construction_tail > 0)
   {
-    this->builder =
-      std::thread(gbwt::insertBatch<text_type>, std::ref(this->index), std::cref(this->construction_buffer),
-                  this->construction_tail, this->inserted_sequences, this->has_both_orientations, this->id_sample_interval);
+    size_type text_length = this->construction_tail;
+    size_type start_id = this->inserted_sequences;
+    bool both_orientations = this->has_both_orientations;
+    size_type sample_interval = this->id_sample_interval;
+    size_type insertion_threads = this->insertion_threads;
+    this->builder = std::thread([this, text_length, start_id, both_orientations,
+      sample_interval, insertion_threads]() {
+      try
+      {
+        gbwt::insertBatch(this->index, this->construction_buffer, text_length,
+          start_id, both_orientations, sample_interval, insertion_threads);
+      }
+      catch(...)
+      {
+        this->builder_error = std::current_exception();
+      }
+    });
     this->inserted_sequences += this->batch_sequences;
     this->batch_sequences = 0;
   }

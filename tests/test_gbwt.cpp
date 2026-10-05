@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -230,6 +231,110 @@ TYPED_TEST(SerializeTest, SimpleSDSVersion)
     // Convert to GBWT, as we can only compare them.
     GBWT loaded(loaded_index);
     compareGBWTs(loaded, truth, "Simple-SDS version " + std::to_string(version));
+  }
+}
+
+//------------------------------------------------------------------------------
+
+TEST(GBWTBuilderTest, InsertionThreads)
+{
+  constexpr size_type parallel_cohort_paths = 5000;
+  constexpr size_type batch_size = 36000;
+  std::vector<vector_type> paths {
+    vector_type(),
+    createPath({ { 1, false } }),
+    createPath({ { 1, false }, { 2, false }, { 1, false } }),
+    createPath({ { 2, false }, { 3, true }, { 2, false } })
+  };
+  for(size_type path_id = 0; path_id < parallel_cohort_paths; path_id++)
+  {
+    node_type shared = 1 + (path_id % 4), target = 5 + (path_id % 4);
+    vector_type path = createPath({ { shared, false }, { target, path_id % 2 == 0 },
+                                    { shared, true }, { target, false } });
+    if(path_id % 2 == 0) { path.resize(2); }
+    paths.push_back(path);
+  }
+
+  auto add_metadata = [&](DynamicGBWT& index)
+  {
+    index.addMetadata();
+    index.metadata.setSamples({ "sample" });
+    index.metadata.setContigs({ "builder" });
+    index.metadata.setHaplotypes(paths.size());
+    for(size_type path_id = 0; path_id < paths.size(); path_id++)
+    {
+      index.metadata.addPath(0, 0, path_id, 0);
+    }
+  };
+  auto finish = [&](GBWTBuilder& builder)
+  {
+    for(const vector_type& path : paths) { builder.insert(path, true); }
+    builder.finish();
+    DynamicGBWT result(builder.index);
+    add_metadata(result);
+    return result;
+  };
+  auto check_paths = [&](const GBWT& index)
+  {
+    ASSERT_EQ(index.sequences(), 2 * paths.size()) << "Wrong number of oriented sequences";
+    ASSERT_EQ(index.metadata.paths(), paths.size()) << "Wrong number of metadata paths";
+    for(size_type path_id = 0; path_id < paths.size(); path_id++)
+    {
+      EXPECT_EQ(index.extract(2 * path_id), paths[path_id]) << "Wrong forward path " << path_id;
+      vector_type reverse;
+      reversePath(paths[path_id], reverse);
+      EXPECT_EQ(index.extract(2 * path_id + 1), reverse) << "Wrong reverse path " << path_id;
+    }
+  };
+  auto reload = [](const auto& index, const std::string& basename)
+  {
+    std::string filename = TempFile::getName(basename);
+    sdsl::store_to_file(index, filename);
+    auto result(index);
+    sdsl::load_from_file(result, filename);
+    TempFile::remove(filename);
+    return result;
+  };
+  auto serialize = [](const auto& index)
+  {
+    std::ostringstream stream;
+    index.serialize(stream);
+    return stream.str();
+  };
+
+  for(size_type sample_interval : { 0, 2 })
+  {
+    // The first batch has 9002 sequences, exceeding the 8192-sequence gate;
+    // the later partial batch exercises the serial remainder.
+    GBWTBuilder default_builder(32, batch_size, sample_interval);
+    DynamicGBWT serial_dynamic = finish(default_builder);
+    GBWT serial(serial_dynamic);
+    check_paths(serial);
+
+    for(size_type insertion_threads : { 0, 1, 2, 4, 24 })
+    {
+      GBWTBuilder worker_builder(32, batch_size, sample_interval, insertion_threads);
+      DynamicGBWT parallel_dynamic = finish(worker_builder);
+      ASSERT_EQ(parallel_dynamic.bwt.size(), serial_dynamic.bwt.size());
+      for(size_type record_id = 0; record_id < serial_dynamic.bwt.size(); record_id++)
+      {
+        EXPECT_EQ(parallel_dynamic.bwt[record_id].incoming, serial_dynamic.bwt[record_id].incoming)
+          << "Wrong incoming record " << record_id;
+      }
+
+      GBWT parallel(parallel_dynamic);
+      std::string test_case = std::to_string(insertion_threads) + " insertion threads, sample interval " + std::to_string(sample_interval);
+      compareGBWTs(parallel, serial, test_case);
+      EXPECT_EQ(serialize(parallel_dynamic), serialize(serial_dynamic));
+      EXPECT_EQ(serialize(parallel), serialize(serial));
+      check_paths(parallel);
+
+      DynamicGBWT loaded_dynamic = reload(parallel_dynamic, "gbwt-builder-dynamic");
+      compareGBWTs(GBWT(loaded_dynamic), serial, test_case + " dynamic reload");
+      GBWT loaded_compressed = reload(parallel, "gbwt-builder-compressed");
+      compareGBWTs(loaded_compressed, serial, test_case + " compressed reload");
+      check_paths(loaded_compressed);
+    }
   }
 }
 
